@@ -249,6 +249,21 @@ Beyond the basic options, FastSplat now exposes LichtFeld's quality knobs:
 | **`--enable-mip`** | Anti-aliasing / mip filter | Usually on; negligible cost |
 | **`--ppisp`** | Per-camera appearance correction | When auto-WB / auto-exposure drifted between shots. **Off** when you locked exposure across deliberately-different lighting — would erase real signal. |
 
+## Progress bar
+
+A live progress bar + status line sits between the Go button and the log pane. It parses log output in real time to detect the current pipeline stage and intra-stage progress.
+
+Currently understood patterns:
+- **Masking** — `image N/M`
+- **Feature extraction** — `Processed file [N/M]`
+- **Feature matching (exhaustive)** — `Processing block [I/8, J/8]`
+- **COLMAP mapper** — `num_reg_frames=N` against total photo count
+- **LichtFeld training** — `iteration N` against total iter from settings
+
+Stages with unknown log formats (sequential matching, GLOMAP mapper output, some training paths) show "in progress" without a percentage until I see real logs to parse. The bar still advances correctly when those stages complete — they just don't have intra-stage granularity yet.
+
+ETA (next phase): in-stage extrapolation from observed rate. Coming once I have a few full log files in `logs/` to calibrate against.
+
 ## Per-run logs
 
 Every Go click writes a complete log of the run to `logs/<timestamp>__<scene-name>.log` next to the script. The file mirrors what the in-app log pane shows, with a header capturing the run's config (preset, matcher, iter, max-cap, all the flags).

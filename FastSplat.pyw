@@ -12,9 +12,11 @@ from __future__ import annotations
 import json
 import os
 import queue
+import re
 import shutil
 import subprocess
 import threading
+import time
 import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
@@ -127,6 +129,224 @@ def estimate_vram_gb(max_cap: int, sh_degree: int = 2,
     gaussian_gb = (max_cap / 1_000_000.0) * per_million_gb
     overhead_gb = 3.5 + (1.5 if viewer_running else 0.0)
     return gaussian_gb + overhead_gb
+
+
+# --- Progress tracker -------------------------------------------------------
+# Watches lines flowing through the in-app log, detects which pipeline stage
+# is running, and exposes per-stage + overall progress + an in-stage ETA.
+# Updated only from the UI thread (in _drain_queue), so no locking required.
+
+class ProgressTracker:
+    # Default weights — re-normalised at reset time based on which stages
+    # are actually going to run (e.g. masking off, training off).
+    DEFAULT_WEIGHTS: dict[str, float] = {
+        "masking":         10.0,
+        "sfm_combined":    50.0,   # used when COLMAP automatic_reconstructor runs (no GLOMAP)
+        "feature_extract":  5.0,
+        "matching":        40.0,
+        "mapper":          10.0,
+        "training":        35.0,
+    }
+
+    # Pre-compiled patterns for known log lines.
+    PAT_MASKING_PROGRESS = re.compile(r"^\s*(\d+)/(\d+)\s*\(.*img/s")
+    PAT_EXTRACT_PROGRESS = re.compile(r"Processed file \[(\d+)/(\d+)\]")
+    PAT_MATCH_BLOCK      = re.compile(r"Processing block \[(\d+)/(\d+),\s*(\d+)/(\d+)\]")
+    PAT_MAPPER_REG       = re.compile(r"num_reg_frames=(\d+)")
+    PAT_TRAINING_ITER    = re.compile(r"iteration (\d+)\b")
+    PAT_PHOTO_TOTAL      = re.compile(r"Processed file \[\d+/(\d+)\]")
+
+    def __init__(self) -> None:
+        self.reset()
+
+    def reset(self, *, mask_enabled: bool = False, train_enabled: bool = True,
+              total_iter: int = 7000) -> None:
+        # Build the active stages list dynamically — junction is free, sfm is
+        # always present (in one form), masking + training are toggles.
+        self.active_stages: list[str] = []
+        if mask_enabled:
+            self.active_stages.append("masking")
+        # We don't know yet if SfM will be the combined or split path.
+        # Start in "sfm_combined"; if we see GLOMAP's split-step markers,
+        # we'll swap in feature_extract/matching/mapper.
+        self.active_stages.append("sfm_combined")
+        if train_enabled:
+            self.active_stages.append("training")
+
+        self.current_stage: str | None = None
+        self.stage_progress: float = 0.0
+        self.stage_detail: str = ""
+        self.stage_start_time: float | None = None
+        self.completed_weight: float = 0.0
+        self.pipeline_start_time: float = time.monotonic()
+        self.total_iter: int = total_iter
+
+        # Extra state for specific stages
+        self.match_total_blocks: int = 64        # 8x8 default; refined if seen otherwise
+        self.match_blocks_done: int = 0
+        self.photo_total: int = 0                # known after first extract line
+        self.done: bool = False
+
+    # -- public API ------------------------------------------------------
+    def feed(self, line: str) -> None:
+        if self.done:
+            return
+
+        # ----- Stage transitions -----
+        if "--- rembg masking" in line or "--- HSV sky masking" in line:
+            self._begin_stage("masking")
+            return
+        if "Step 1/3: feature extraction" in line:
+            # GLOMAP path is active — swap sfm_combined for the split stages
+            self._swap_sfm_combined_for_split()
+            self._begin_stage("feature_extract")
+            return
+        if "Step 2/3: feature matching" in line:
+            self._begin_stage("matching")
+            return
+        if "Step 3/3: GLOMAP global mapper" in line or "Step 3/3: COLMAP incremental mapper" in line:
+            self._begin_stage("mapper")
+            return
+        if "--- SfM: COLMAP automatic_reconstructor" in line:
+            self._begin_stage("sfm_combined")
+            return
+        if "--- LichtFeld training ---" in line:
+            self._begin_stage("training")
+            return
+        if "Sparse model already present" in line:
+            # SfM is being skipped — credit the combined SfM weight as already done
+            self._skip_sfm_stages()
+            return
+
+        # ----- Stage finishing sentinels -----
+        if line.strip() == "Done.":
+            self._finish()
+            return
+
+        # ----- Intra-stage progress -----
+        if self.current_stage == "masking":
+            m = self.PAT_MASKING_PROGRESS.search(line)
+            if m:
+                self.stage_progress = min(1.0, int(m.group(1)) / max(int(m.group(2)), 1))
+                self.stage_detail = f"image {m.group(1)}/{m.group(2)}"
+            return
+
+        if self.current_stage == "feature_extract":
+            m = self.PAT_EXTRACT_PROGRESS.search(line)
+            if m:
+                done, total = int(m.group(1)), max(int(m.group(2)), 1)
+                self.photo_total = total
+                self.stage_progress = min(1.0, done / total)
+                self.stage_detail = f"image {done}/{total}"
+            return
+
+        if self.current_stage == "matching":
+            m = self.PAT_MATCH_BLOCK.search(line)
+            if m:
+                i, total_i = int(m.group(1)), int(m.group(2))
+                j, total_j = int(m.group(3)), int(m.group(4))
+                self.match_total_blocks = total_i * total_j
+                # Linear index, 1-based: (i-1) * total_j + j  (the block JUST STARTING)
+                # Subtract one to get "blocks completed"
+                self.match_blocks_done = max(0, (i - 1) * total_j + j - 1)
+                self.stage_progress = min(1.0, self.match_blocks_done / self.match_total_blocks)
+                self.stage_detail = (f"block {self.match_blocks_done}/{self.match_total_blocks} "
+                                     f"(row {i}/{total_i})")
+            return
+
+        if self.current_stage == "mapper":
+            m = self.PAT_MAPPER_REG.search(line)
+            if m and self.photo_total > 0:
+                reg = int(m.group(1))
+                self.stage_progress = min(1.0, reg / self.photo_total)
+                self.stage_detail = f"registered {reg}/{self.photo_total} cameras"
+            return
+
+        if self.current_stage == "training":
+            m = self.PAT_TRAINING_ITER.search(line)
+            if m:
+                cur = int(m.group(1))
+                self.stage_progress = min(1.0, cur / max(self.total_iter, 1))
+                self.stage_detail = f"iter {cur}/{self.total_iter:,}"
+            return
+
+    def overall_progress(self) -> float:
+        """0-1 progress across the whole pipeline."""
+        if self.done:
+            return 1.0
+        total = sum(self.DEFAULT_WEIGHTS[s] for s in self.active_stages) or 1.0
+        current_stage_weight = self.DEFAULT_WEIGHTS.get(self.current_stage, 0)
+        return min(1.0, (self.completed_weight + current_stage_weight * self.stage_progress) / total)
+
+    def eta_seconds(self) -> int | None:
+        """Best-guess seconds remaining for the current stage. None when we
+        don't have enough signal (no current stage, or <5% in)."""
+        if self.done or self.current_stage is None or self.stage_progress < 0.05:
+            return None
+        if self.stage_start_time is None:
+            return None
+        elapsed = time.monotonic() - self.stage_start_time
+        return int(elapsed * (1 - self.stage_progress) / self.stage_progress)
+
+    def status_text(self) -> str:
+        if self.done:
+            return "Done."
+        if self.current_stage is None:
+            return "Idle"
+        eta = self.eta_seconds()
+        eta_text = f" · ~{self._fmt_dur(eta)} remaining" if eta is not None else ""
+        if self.stage_detail:
+            return f"{self._pretty_stage()}: {self.stage_detail}{eta_text}"
+        return f"{self._pretty_stage()}: in progress{eta_text}"
+
+    # -- internals -------------------------------------------------------
+    def _begin_stage(self, name: str) -> None:
+        if self.current_stage is not None and self.current_stage != name:
+            self.completed_weight += self.DEFAULT_WEIGHTS.get(self.current_stage, 0) * 1.0
+        self.current_stage = name
+        self.stage_progress = 0.0
+        self.stage_detail = ""
+        self.stage_start_time = time.monotonic()
+
+    def _swap_sfm_combined_for_split(self) -> None:
+        """If active_stages still has 'sfm_combined' from reset, replace it
+        with the split GLOMAP path stages on first detection."""
+        if "sfm_combined" in self.active_stages:
+            idx = self.active_stages.index("sfm_combined")
+            self.active_stages[idx:idx + 1] = ["feature_extract", "matching", "mapper"]
+
+    def _skip_sfm_stages(self) -> None:
+        """SfM was reused from a previous run — credit its full weight."""
+        for s in ("sfm_combined", "feature_extract", "matching", "mapper"):
+            if s in self.active_stages and s != self.current_stage:
+                self.completed_weight += self.DEFAULT_WEIGHTS[s]
+                if s in self.active_stages:
+                    self.active_stages.remove(s)
+
+    def _finish(self) -> None:
+        if self.current_stage is not None:
+            self.completed_weight += self.DEFAULT_WEIGHTS.get(self.current_stage, 0)
+        self.current_stage = None
+        self.stage_progress = 0.0
+        self.done = True
+
+    def _pretty_stage(self) -> str:
+        return {
+            "masking":         "Masking",
+            "sfm_combined":    "SfM",
+            "feature_extract": "Feature extraction",
+            "matching":        "Feature matching",
+            "mapper":          "Mapper",
+            "training":        "Training",
+        }.get(self.current_stage or "", str(self.current_stage))
+
+    @staticmethod
+    def _fmt_dur(seconds: int) -> str:
+        if seconds < 60:
+            return f"{seconds}s"
+        if seconds < 3600:
+            return f"{seconds // 60}m"
+        return f"{seconds // 3600}h{(seconds % 3600) // 60}m"
 # ---------------------------------------------------------------------------
 
 
@@ -230,6 +450,8 @@ class Launcher(tk.Tk):
         # File handle for the current run's saved log (None when not running).
         # Written to via _log(); opened in _on_go, closed when worker finishes.
         self._log_file = None  # type: ignore[var-annotated]
+        # Progress tracker — fed log lines from _drain_queue (UI thread).
+        self._progress = ProgressTracker()
 
         # Suppress trace callbacks during settings load so we don't
         # repeatedly fire the judger.
@@ -460,9 +682,23 @@ class Launcher(tk.Tk):
                 "Run the configured pipeline (mask -> COLMAP -> train -> open viewer). "
                 "Safe to re-click: completed stages auto-skip on the next run.")
 
+        # Progress row (bar + status text)
+        progress_frame = ttk.Frame(self)
+        progress_frame.grid(row=9, column=0, columnspan=3, sticky="we", padx=8, pady=(2, 0))
+        self.progressbar = ttk.Progressbar(progress_frame, orient="horizontal",
+                                           mode="determinate", maximum=100)
+        self.progressbar.pack(side="top", fill="x", expand=True)
+        self.progress_label_var = tk.StringVar(value="Idle")
+        self.progress_label = tk.Label(progress_frame,
+                                       textvariable=self.progress_label_var,
+                                       anchor="w", justify="left",
+                                       bg=self.cget("bg"), fg="#bbbbbb",
+                                       font=("Segoe UI", 9))
+        self.progress_label.pack(side="top", fill="x", expand=True, pady=(2, 0))
+
         # Log
         log_frame = ttk.Frame(self)
-        log_frame.grid(row=9, column=0, columnspan=3, sticky="nsew", **pad)
+        log_frame.grid(row=10, column=0, columnspan=3, sticky="nsew", **pad)
         self.log = tk.Text(log_frame, wrap="word", height=20, bg="#1e2832", fg="#dddddd",
                            insertbackground="#ffffff", font=("Consolas", 10))
         self.log.pack(side="left", fill="both", expand=True)
@@ -470,7 +706,7 @@ class Launcher(tk.Tk):
         log_scroll.pack(side="right", fill="y")
         self.log["yscrollcommand"] = log_scroll.set
 
-        self.grid_rowconfigure(9, weight=1)
+        self.grid_rowconfigure(10, weight=1)
         self.grid_columnconfigure(1, weight=1)
 
     # -- Pickers -------------------------------------------------------------
@@ -502,18 +738,36 @@ class Launcher(tk.Tk):
                 pass
 
     def _drain_queue(self) -> None:
+        progress_dirty = False
         try:
             while True:
                 msg = self._msg_q.get_nowait()
                 if msg is None:  # sentinel: worker done
                     self.go_btn.config(state="normal", text="Go")
                     self._close_log_file()
+                    # Force one final progress refresh so "Done." reflects
+                    self._progress.feed("Done.\n")
+                    progress_dirty = True
                     continue
                 self.log.insert("end", msg)
                 self.log.see("end")
+                # Feed every log line into the progress tracker. Cheap regex
+                # work; only touches UI thread state.
+                for sub in msg.splitlines():
+                    self._progress.feed(sub)
+                progress_dirty = True
         except queue.Empty:
             pass
+        if progress_dirty:
+            self._refresh_progress_ui()
         self.after(50, self._drain_queue)
+
+    def _refresh_progress_ui(self) -> None:
+        try:
+            self.progressbar["value"] = self._progress.overall_progress() * 100
+            self.progress_label_var.set(self._progress.status_text())
+        except Exception:
+            pass
 
     def _open_log_file(self) -> None:
         """Open a per-run log file in logs/. Filename includes the timestamp and
@@ -597,6 +851,13 @@ class Launcher(tk.Tk):
 
         self.log.delete("1.0", "end")
         self.go_btn.config(state="disabled", text="Working...")
+        # Reset progress tracker for the new run
+        self._progress.reset(
+            mask_enabled=bool(self.mask_subject.get()),
+            train_enabled=bool(self.run_train.get()),
+            total_iter=int(self.iter_var.get()),
+        )
+        self._refresh_progress_ui()
         self._save_settings()  # remember this run's config even if the app crashes mid-pipeline
         self._open_log_file()
         self._worker = threading.Thread(target=self._run_pipeline, daemon=True)
