@@ -120,14 +120,20 @@ PRESETS: dict[str, dict[str, object]] = {
 # Empirical VRAM cost during training.
 # - Per-million-gaussians is dominated by Adam optimizer state + backprop
 #   intermediates, which scale with the number of SH coefficients (i.e., SH degree).
-# - Fixed overhead covers CUDA runtime + the Vulkan viewer's interop buffer.
+# - Fixed overhead covers CUDA runtime + Python + the trainer's own viewer.
+#   The trainer always shows its viewer GUI in --train mode, so the viewer
+#   cost applies regardless of the "Open viewer after" checkbox (which only
+#   controls a SECOND viewer process launched *after* training completes,
+#   well past the densification-driven VRAM peak).
 # Numbers are conservative estimates calibrated to a 16 GB card with the default
 # strategy/options. Within ~30% of reality; meant for "are you in danger" warnings.
+# The viewer_running parameter is kept for future --headless training support.
 def estimate_vram_gb(max_cap: int, sh_degree: int = 2,
                      viewer_running: bool = True) -> float:
     per_million_gb = {0: 1.5, 1: 2.2, 2: 3.0, 3: 4.2}.get(sh_degree, 3.0)
     gaussian_gb = (max_cap / 1_000_000.0) * per_million_gb
-    overhead_gb = 3.5 + (1.5 if viewer_running else 0.0)
+    # Base overhead = CUDA runtime + Python + trainer's Vulkan viewer interop
+    overhead_gb = 5.0 if viewer_running else 3.5
     return gaussian_gb + overhead_gb
 
 
@@ -471,10 +477,11 @@ class Launcher(tk.Tk):
 
         # Auto-refresh the judger whenever the photos path changes.
         self.photos_var.trace_add("write", lambda *_: self._refresh_judger())
-        # Update the VRAM estimate when the cap, SH degree, or viewer toggle changes.
+        # Update the VRAM estimate when the cap or SH degree changes.
+        # (Not bound to open_after: that controls a post-training viewer that
+        # doesn't impact training peak VRAM — see estimate_vram_gb comment.)
         self.max_cap_var.trace_add("write", lambda *_: self._refresh_vram_estimate())
         self.sh_degree_var.trace_add("write", lambda *_: self._refresh_vram_estimate())
-        self.open_after.trace_add("write", lambda *_: self._refresh_vram_estimate())
 
     # -- UI ------------------------------------------------------------------
     def _build_ui(self) -> None:
@@ -839,7 +846,7 @@ class Launcher(tk.Tk):
         if self.run_train.get():
             est = estimate_vram_gb(int(self.max_cap_var.get()),
                                    sh_degree=int(self.sh_degree_var.get()),
-                                   viewer_running=bool(self.open_after.get()))
+                                   viewer_running=True)
             if est > GPU_VRAM_GB * 0.90:
                 proceed = messagebox.askyesno(
                     "FastSplat — VRAM warning",
@@ -1228,9 +1235,12 @@ class Launcher(tk.Tk):
         except (tk.TclError, ValueError):
             self.vram_label.config(text="")
             return
+        # viewer_running is always True for --train runs (the trainer's own
+        # GUI is up during training). The open_after checkbox controls a
+        # SECOND, post-training viewer that doesn't impact peak VRAM.
         est = estimate_vram_gb(cap,
                                sh_degree=int(self.sh_degree_var.get()),
-                               viewer_running=bool(self.open_after.get()))
+                               viewer_running=True)
         # Color thresholds: < 70% of card = green, 70-90% = amber, > 90% = red
         ratio = est / GPU_VRAM_GB
         if ratio < 0.70:
