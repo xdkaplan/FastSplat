@@ -97,36 +97,50 @@ The output folder defaults to `<parent>\<name>-output\` (sibling of the photos f
 
 | Control | Default | What it does |
 |---------|---------|--------------|
-| Output tag/name | _(blank)_ | If set, the final .ply is named `<tag>.ply` instead of `splat_<iter>.ply`. Useful for stamping runs like `monument-pixel-v1`, `monument-dslr-masked`. Lets multiple runs coexist in one output folder without overwrite. |
-| Iterations | 7000 | Training iterations. 7k = quick smoke test (~5–15 min on a Quadro RTX 5000). 30k = production quality. |
-| COLMAP | on | Run COLMAP. Turn off to skip if you've already done it for this scene. |
-| Train | on | Run LichtFeld training. Turn off to only do the COLMAP step. |
-| --gut | on | Pass `--gut` to LichtFeld. Safe default — handles distorted-camera datasets (COLMAP's `SIMPLE_RADIAL` model). Turn off only if you've explicitly forced a pinhole model. |
-| Open viewer after | on | Launch LichtFeld in viewer mode (`-v`) on the latest .ply after training completes. |
-| Max gaussians | 1,000,000 | Ceiling on densification. Higher = sharper splat potential but more VRAM. The estimate label next to the field updates live: green = safe, amber = borderline, red = likely OOM. Pre-flight dialog blocks Go if you're in the red zone. For 16 GB cards: 1M is safe, 2M is borderline, 3M+ risks OOM. Tune `GPU_VRAM_GB` at the top of `FastSplat.pyw` for other cards. |
-| Mask subject (rembg) | off | Run [rembg](https://github.com/danielgatis/rembg) on every input photo to extract the subject before COLMAP. Background pixels become alpha=0 + RGB neutral gray, so COLMAP finds no features in the background and LichtFeld's alpha-as-mask drops those pixels from the loss. Eliminates the 100m halo of distant gaussians for outdoor subjects. |
-| Model (rembg) | `u2net` | Which rembg model to use. `u2net` (default, fast) is good for clear figure/ground scenes; `birefnet-general` is sharper for complex backgrounds but ~5× slower. Smoke-test on one photo with `rembg_smoke.py` before picking. |
+| **Preset** | `(custom)` | Snap all flags to a curated config: Draft (3k iter ~2-5 min), Quick test (7k), **Pixel 6a multi-room** (20k, 2M cap, bilateral+mip+gut), Outdoor monument DSLR (30k, SH 3). Doesn't touch folders/tag. |
+| Output tag/name | _(blank)_ | If set, the final .ply is named `<tag>.ply` instead of `splat_<iter>.ply`. Lets multiple versions of a scene coexist in one output folder. |
+| Iterations | 7000 | Training iterations. Diminishing returns past 30k. LichtFeld may add bilateral-grid extension iters automatically (e.g. 20000 → 21733). |
+| Max gaussians | 1,000,000 | Densification ceiling. Live VRAM estimate label updates as you change it (green/amber/red). Pre-flight dialog blocks Go in the red zone. Tune `GPU_VRAM_GB` constant in the script for non-16 GB cards. |
+| SfM | on | Run structure-from-motion (COLMAP front-end + GLOMAP mapper if installed, else COLMAP-only). |
+| **Matcher** | `exhaustive` | `exhaustive` = every-photo-vs-every-photo (slow O(N²)). `sequential` = ±30 neighbors in capture order (5-10× faster for walk-throughs). |
+| Train | on | Run LichtFeld training. Uncheck to stop after SfM. |
+| --gut | on | 3DGUT mode. Mandatory for non-pinhole cameras (SIMPLE_RADIAL etc.); no-op for pinhole. |
+| Open viewer after | **off** | Launch a SECOND LichtFeld instance in viewer mode after training. Usually unnecessary — the trainer's window already shows the result. |
+| **SH degree** | 2 | Spherical harmonic degree for view-dependent color. 0 = flat. 2 = default. 3 = max quality, ~40% more VRAM/gaussian. |
+| `--bilateral-grid` | off | Per-region color refinement. Helps multi-room scenes with varied lighting. Modest VRAM cost. |
+| `--enable-mip` | off | Anti-aliasing filter for the viewer. Negligible cost. |
+| `--ppisp` | off | Per-camera appearance correction. Helpful when WB/exposure drifted between shots. **AVOID** if exposure was locked across deliberately different lighting — PPISP would erase the real signal. |
+| Mask subject (rembg) | off | Subject extraction via rembg before COLMAP. Eliminates outdoor halo. Often removes too much (chops bases). |
+| Model (rembg) | `u2net` | rembg model. `birefnet-general` = best edges, slowest. `isnet-general-use` = middle ground. `u2net` = fast but chops bases. |
+| Sky-only | off | **EXPERIMENTAL — known hit-or-miss.** Color-based sky filter (HSV thresholds, top 50% of frame). Bypasses rembg. Doesn't work for compositions where subject extends to top of frame or where bright building features look like sky. |
+| Force re-mask | off | Discard cached masks and reprocess. Auto-triggered when you change the model. |
 
 ## Output layout
 
 ```
-E:\path\to\photos              <- you point FastSplat here
-E:\path\to\photos-scene\       <- created by FastSplat
-  images\                      <- junction back to the photos folder
-  sparse\0\                    <- COLMAP output: cameras.bin, images.bin, points3D.bin
-  database.db                  <- COLMAP feature database
-  colmap.log                   <- COLMAP stdout (handy if something fails)
-E:\path\to\photos-output\      <- created by FastSplat
-  splat_<iter>.ply             <- one or more training checkpoints; latest is the final
+E:\path\to\photos                       <- you point FastSplat here
+E:\path\to\photos-scene\                <- created by FastSplat
+  images\                               <- junction back to the photos folder
+  images_masked\                        <- only if masking is enabled
+  sparse\0\                             <- SfM output: cameras.bin, images.bin, points3D.bin (+ frames/rigs)
+  database.db                           <- COLMAP feature database
+  .fastsplat_state.json                 <- tracks pipeline mode for cache invalidation
+  .rembg_meta.json                      <- only if masking; tracks which model produced the masks
+E:\path\to\photos-output\               <- created by FastSplat
+  <tag>.ply                             <- final, if Output tag was set
+  splat_<iter>.ply                      <- otherwise, named by iteration
+  checkpoints\checkpoint.resume         <- mid-training save (auto-managed)
+C:\Repos\xdkaplan\FastSplat\logs\
+  <timestamp>__<scene>.log              <- per-run merged log (FastSplat + COLMAP + LichtFeld stdout)
 ```
 
 ## After training: cropping and sharing
 
-FastSplat stops once the viewer is open with the trained splat. The rest is manual GUI work:
+LichtFeld's trainer window stays open with the trained splat already loaded. From there:
 
-1. **Crop** floaters and background junk inside the LichtFeld viewer (Select tool, marquee-drag, Delete).
-2. **Export PLY** from LichtFeld's File menu.
-3. **(Optional) Adjust exposure / color** in [SuperSplat](https://superspl.at/editor) — LichtFeld's render-time exposure controls don't bake into export. SuperSplat's do.
+1. **Crop** floaters and background junk (Select tool key `1`, marquee-drag, Delete; or Brush key `6`).
+2. **Export PLY** from LichtFeld's File menu — master copy.
+3. **(Optional) Adjust exposure / color** in [SuperSplat](https://superspl.at/editor). LichtFeld's render-time exposure controls don't bake into export; SuperSplat's do. Use **SOG export** from SuperSplat (not regular PLY) so deleted gaussians are actually removed.
 4. **Export HTML viewer** from LichtFeld for sharing — single `.html` with the splat embedded.
 5. **Host on [Netlify Drop](https://app.netlify.com/drop)** — drag the `.html`, get a shareable URL.
 
