@@ -161,6 +161,9 @@ class ProgressTracker:
     PAT_MAPPER_REG       = re.compile(r"num_reg_frames=(\d+)")
     PAT_TRAINING_ITER    = re.compile(r"iteration (\d+)\b")
     PAT_PHOTO_TOTAL      = re.compile(r"Processed file \[\d+/(\d+)\]")
+    # LichtFeld's actual planned iter count — may be higher than --iter when
+    # bilateral grid / refinement extensions add post-training iters.
+    PAT_TRAINER_PLAN     = re.compile(r"Initializing trainer with (\d+) iterations")
 
     def __init__(self) -> None:
         self.reset()
@@ -269,11 +272,17 @@ class ProgressTracker:
             return
 
         if self.current_stage == "training":
+            # First, watch for LichtFeld declaring its actual planned iter
+            # count — may be higher than the user-configured --iter when
+            # --bilateral-grid adds refinement iters post-main-training.
+            plan = self.PAT_TRAINER_PLAN.search(line)
+            if plan:
+                self.total_iter = int(plan.group(1))
             m = self.PAT_TRAINING_ITER.search(line)
             if m:
                 cur = int(m.group(1))
                 self.stage_progress = min(1.0, cur / max(self.total_iter, 1))
-                self.stage_detail = f"iter {cur}/{self.total_iter:,}"
+                self.stage_detail = f"iter {cur:,}/{self.total_iter:,}"
             return
 
     def overall_progress(self) -> float:
@@ -814,7 +823,7 @@ class Launcher(tk.Tk):
             self._log_file.write(f"# Mask:      subject={self.mask_subject.get()} "
                                  f"model={self.mask_model.get()} "
                                  f"sky_only={self.sky_only.get()}\n")
-            self._log_file.write("# -" * 30 + "\n\n")
+            self._log_file.write("# " + "-" * 70 + "\n\n")
             self._log_file.flush()
             self._log(f"Logging to: {log_path}\n")
         except Exception as exc:  # noqa: BLE001
