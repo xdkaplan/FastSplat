@@ -1121,7 +1121,13 @@ class Launcher(tk.Tk):
             self._log(f"{matcher_cmd_name} failed (exit {rc})\n")
             return rc
 
-        # 2c. GLOMAP global mapper — the speedup-from-GLOMAP step.
+        # 2c. Mapper — try GLOMAP first, fall back to COLMAP if it fails.
+        # Common failure mode: a stable GLOMAP release was built against an
+        # older COLMAP schema and chokes on a COLMAP 4.1 database with
+        # "SQL logic error" at database.cc:49. The features + matches in the
+        # database are fine — only the GLOMAP mapper binary can't read them.
+        # COLMAP's own mapper on the same database works and produces the
+        # same sparse-model format (cameras.bin / images.bin / points3D.bin).
         self._log("Step 3/3: GLOMAP global mapper...\n")
         rc = self._stream([
             GLOMAP_EXE, "mapper",
@@ -1129,8 +1135,31 @@ class Launcher(tk.Tk):
             "--image_path", str(image_path),
             "--output_path", str(sparse),
         ], env=colmap_env())
+        if rc == 0:
+            return 0
+
+        # GLOMAP failed — fall back to COLMAP mapper without losing the
+        # ~hour of feature extraction + matching already in the database.
+        self._log(f"\nGLOMAP mapper failed (exit {rc}). "
+                  "This usually means a schema mismatch between GLOMAP and "
+                  "the installed COLMAP version (e.g. GLOMAP built against "
+                  "COLMAP 3.x can't read COLMAP 4.1's database).\n"
+                  "Falling back to COLMAP's incremental mapper on the same "
+                  "database (slower than GLOMAP, but produces identical output).\n\n")
+        # Clear any half-written GLOMAP partial outputs from sparse/ so
+        # COLMAP mapper has a clean target dir.
+        for sub in (list(sparse.iterdir()) if sparse.exists() else []):
+            if sub.is_dir() and sub.name.isdigit():
+                shutil.rmtree(sub, ignore_errors=True)
+        self._log("Step 3/3 (fallback): COLMAP incremental mapper...\n")
+        rc = self._stream([
+            COLMAP_EXE, "mapper",
+            "--database_path", str(db),
+            "--image_path", str(image_path),
+            "--output_path", str(sparse),
+        ], env=colmap_env())
         if rc != 0:
-            self._log(f"glomap mapper failed (exit {rc})\n")
+            self._log(f"colmap mapper also failed (exit {rc})\n")
         return rc
 
     def _invalidate_colmap_cache(self, scene: Path) -> None:
