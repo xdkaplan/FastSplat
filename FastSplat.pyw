@@ -64,8 +64,11 @@ GPU_VRAM_GB = 16
 PRESETS: dict[str, dict[str, object]] = {
     "(custom)": {},  # placeholder; selecting it doesn't change anything
     "Pixel 6a multi-room": {
+        # Calibrated against a 371-photo Harvard-apt run: 1.2M cap was
+        # binding-constrained (densification hit the ceiling exactly).
+        # Bumped to 2M; VRAM estimate ~11 GB on a 16 GB card with viewer on.
         "iter":              20_000,
-        "max_cap":           1_200_000,
+        "max_cap":           2_000_000,
         "matcher":           "sequential",   # ordered walk-through; ±30 neighbors plenty
         "use_gut":           True,
         "use_bilateral_grid": True,
