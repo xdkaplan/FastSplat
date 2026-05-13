@@ -1,0 +1,17 @@
+# Per-run log files written by FastSplat
+logs/
+
+# Python bytecode
+__pycache__/
+*.pyc
+*.pyo
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*~
+
+# OS
+Thumbs.db
+.DS_Store
