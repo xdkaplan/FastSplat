@@ -73,7 +73,7 @@ PRESETS: dict[str, dict[str, object]] = {
         "sh_degree":         2,
         "use_ppisp":         False,   # locked exposure -> PPISP would over-correct real lighting
         "mask_subject":      False,
-        "open_after":        True,
+        "open_after":        False,
     },
     "Outdoor monument (DSLR, manual)": {
         "iter":              30_000,
@@ -85,7 +85,7 @@ PRESETS: dict[str, dict[str, object]] = {
         "sh_degree":         3,
         "use_ppisp":         False,
         "mask_subject":      False,
-        "open_after":        True,
+        "open_after":        False,
     },
     "Draft (fastest, ~2-5 min)": {
         # Goal: "did the pipeline run + is the rough shape recognizable" in
@@ -99,7 +99,7 @@ PRESETS: dict[str, dict[str, object]] = {
         "sh_degree":         1,        # flat-ish color; fastest per-iter
         "use_ppisp":         False,
         "mask_subject":      False,
-        "open_after":        True,
+        "open_after":        False,
     },
     "Quick test (7k iter)": {
         # Middle ground between draft and full quality. Recognizable splat,
@@ -113,7 +113,7 @@ PRESETS: dict[str, dict[str, object]] = {
         "sh_degree":         2,
         "use_ppisp":         False,
         "mask_subject":      False,
-        "open_after":        True,
+        "open_after":        False,
     },
 }
 
@@ -427,7 +427,11 @@ class Launcher(tk.Tk):
         self.run_colmap = tk.BooleanVar(value=True)
         self.run_train = tk.BooleanVar(value=True)
         self.use_gut = tk.BooleanVar(value=True)
-        self.open_after = tk.BooleanVar(value=True)
+        # Off by default: --train mode leaves LichtFeld open on the result already,
+        # so launching a second viewer is just a duplicate window. Toggle on for
+        # headless training runs (when we add --headless support) or other cases
+        # where you actively want a separate viewer process.
+        self.open_after = tk.BooleanVar(value=False)
         self.mask_subject = tk.BooleanVar(value=False)
         self.mask_model = tk.StringVar(value="u2net")
         self.sky_only = tk.BooleanVar(value=False)
@@ -594,8 +598,10 @@ class Launcher(tk.Tk):
                                   variable=self.open_after)
         cb_view.pack(side="left", padx=4)
         ToolTip(cb_view,
-                "After training completes, auto-launch LichtFeld in viewer mode (-v) "
-                "on the latest .ply so you can crop / inspect / export immediately.")
+                "After training completes, launch a SECOND LichtFeld instance in "
+                "viewer mode (-v) on the latest .ply. Usually NOT needed — the "
+                "training window stays open with the trained splat already loaded. "
+                "Only useful if you want a separate viewer process from the trainer.")
 
         # Advanced flags row (LichtFeld training quality knobs)
         adv = ttk.Frame(self)
